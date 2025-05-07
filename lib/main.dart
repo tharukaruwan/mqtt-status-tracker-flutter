@@ -41,8 +41,8 @@ class _StatusScreenState extends State<StatusScreen>
   static const _broker = '172.235.63.132'; // Verify this IP address
   static const _port = 1883; // Verify this port
   static const _storagelocationId =
-      '67bd669d69149157396e7e74'; // storagelocation or vehicle
-  static const _salesmenId = '6810c7608f1e11a76ca5ab68'; // salesmen or employee
+      '67d014c9f412a8e6ad4952a9'; // storagelocation or vehicle
+  static const _salesmenId = '67f8f8aaa3a1b1eb85b29416'; // salesmen or employee
   // ■ Extra fields for status payload
   int _pendingSalesOrders = 4;
   int _pendingPaymentsCollected = 6;
