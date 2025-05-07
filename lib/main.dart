@@ -1,12 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io'; // Import for Platform checks if needed later, or for SocketException
 
 import 'package:flutter/material.dart';
 import 'package:connectivity_plus/connectivity_plus.dart'; // Updated import for connectivity_plus API change
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
-// import 'package:mqtt_client/mqtt_browser_client.dart'; // Use this for web
 
 void main() {
   runApp(MyApp());
@@ -42,14 +40,19 @@ class _StatusScreenState extends State<StatusScreen>
   // Ensure your broker is running and accessible from where you run the app.
   static const _broker = '172.235.63.132'; // Verify this IP address
   static const _port = 1883; // Verify this port
+  static const _storagelocationId =
+      '67bd669d69149157396e7e74'; // storagelocation or vehicle
+  static const _salesmenId = '6810c7608f1e11a76ca5ab68'; // salesmen or employee
+  // ■ Extra fields for status payload
+  int _pendingSalesOrders = 4;
+  int _pendingPaymentsCollected = 6;
 
   // !!! IMPORTANT: Verify these topics match exactly with your MQTT setup !!!
-  static const _cmdTopic =
-      'storagelocation/67bd669d69149157396e7e74/'
-      'salesmen/6810c7608f1e11a76ca5ab68/cmd'; // Topic to receive commands
-  static const _statusTopic =
-      'storagelocation/67bd669d69149157396e7e74/'
-      'salesmen/6810c7608f1e11a76ca5ab68/status'; // Topic to send status
+  static String get _cmdTopic =>
+      'storagelocation/$_storagelocationId/salesmen/$_salesmenId/cmd';
+
+  static String get _statusTopic =>
+      'storagelocation/$_storagelocationId/salesmen/$_salesmenId/status';
 
   // Generate a unique client ID
   final String _clientId = 'flutter_${DateTime.now().millisecondsSinceEpoch}';
@@ -170,6 +173,16 @@ class _StatusScreenState extends State<StatusScreen>
   Future<void> _connectAndListen() async {
     if (_client?.connectionStatus?.state == MqttConnectionState.connected)
       return;
+    // Build your JSON map for the offline LWT
+    final offlineWillPayload = json.encode({
+      'salesman': _salesmenId,
+      'pendingPushes': {
+        'salesOrders': _pendingSalesOrders,
+        'paymentsCollected': _pendingPaymentsCollected,
+      },
+      'lastWill': DateTime.now().toLocal().toIso8601String(),
+      'status': 'offline (LWT)',
+    });
 
     _client =
         MqttServerClient.withPort(_broker, _clientId, _port)
@@ -182,7 +195,7 @@ class _StatusScreenState extends State<StatusScreen>
           ..connectionMessage =
               MqttConnectMessage()
                   .withWillTopic(_statusTopic)
-                  .withWillMessage('offline (LWT)')
+                  .withWillMessage(offlineWillPayload)
                   .withWillQos(MqttQos.atLeastOnce)
                   .startClean();
 
@@ -288,14 +301,27 @@ class _StatusScreenState extends State<StatusScreen>
 
   void _publishStatus(String status) {
     if (_client?.connectionStatus?.state == MqttConnectionState.connected) {
-      final builder = MqttClientPayloadBuilder()..addString(status);
+      final payloadMap = {
+        'salesman': _salesmenId,
+        'pendingPushes': {
+          'salesOrders': _pendingSalesOrders,
+          'paymentsCollected': _pendingPaymentsCollected,
+        },
+        'lastWill': DateTime.now().toLocal().toIso8601String(),
+        'status': status,
+      };
+      final payloadString = json.encode(payloadMap);
+
+      final builder = MqttClientPayloadBuilder()..addString(payloadString);
       _client!.publishMessage(
         _statusTopic,
         MqttQos.atLeastOnce,
         builder.payload!,
         retain: false,
       );
-      print('Published status: $status');
+      print('Published status JSON: $payloadString');
+    } else {
+      print('Cannot publish status: MQTT not connected.');
     }
   }
 
