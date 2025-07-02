@@ -1,406 +1,354 @@
 import 'dart:async';
 import 'dart:convert';
-
 import 'package:flutter/material.dart';
-import 'package:connectivity_plus/connectivity_plus.dart'; // Updated import for connectivity_plus API change
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 
 void main() {
-  runApp(MyApp());
+  runApp(const MyApp());
 }
 
-class MyApp extends StatelessWidget {
+class MyApp extends StatefulWidget {
+  const MyApp({super.key}); // Added const constructor
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'MQTT Status & CMD Tracker',
-      theme: ThemeData(
-        // Added some basic theme for better look
-        primarySwatch: Colors.blue,
-        visualDensity: VisualDensity.adaptivePlatformDensity,
-      ),
-      home: StatusScreen(),
-    );
-  }
+  State<MyApp> createState() => _MyAppState();
 }
 
-class StatusScreen extends StatefulWidget {
-  @override
-  _StatusScreenState createState() => _StatusScreenState();
-}
-
-class _StatusScreenState extends State<StatusScreen>
-    with WidgetsBindingObserver {
-  // ─────────────────────────
-  // ■ Configuration
-  // ─────────────────────────
-  // !!! IMPORTANT: Verify the Broker IP and Port are correct and accessible !!!
-  // This IP (172.235.63.132) looks like a public IP range, ensure it's your broker's public IP.
-  // Ensure your broker is running and accessible from where you run the app.
-  static const _broker = '172.235.63.132'; // Verify this IP address
-  static const _port = 1883; // Verify this port
-  static const _storagelocationId =
-      '67d014c9f412a8e6ad4952a9'; // storagelocation or vehicle
-  static const _salesmenId = '67f8f8aaa3a1b1eb85b29416'; // salesmen or employee
-  // ■ Extra fields for status payload
-  int _pendingSalesOrders = 4;
-  int _pendingPaymentsCollected = 6;
-
-  // !!! IMPORTANT: Verify these topics match exactly with your MQTT setup !!!
-  static String get _cmdTopic =>
-      'storagelocation/$_storagelocationId/salesmen/$_salesmenId/cmd';
-
-  static String get _statusTopic =>
-      'storagelocation/$_storagelocationId/salesmen/$_salesmenId/status';
-
-  // Generate a unique client ID
-  final String _clientId = 'flutter_${DateTime.now().millisecondsSinceEpoch}';
-
-  // ─────────────────────────
-  // ■ MQTT + Connectivity
-  // ─────────────────────────
-  MqttServerClient? _client; // Use MqttBrowserClient for web
-  StreamSubscription<List<ConnectivityResult>>?
-  _connectivitySub; // Updated type for connectivity_plus >= 3.0.0
-  Timer? _heartbeatTimer;
+class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
+  MqttServerClient? _client;
+  Timer? _statusTimer;
+  final String _broker = '172.235.63.132';
+  final int _port = 1884; // Changed back to 1883, verify your broker's port
+  final String _userId =
+      'user123'; // This seems to be a fixed user ID for topics
+  late String _clientId; // This is the unique client instance ID
+  String _connectionStatus = 'Initializing...';
+  bool _wasOnline =
+      false; // Tracks if client was previously connected and online
   bool _isConnecting =
-      false; // Added state to prevent multiple connection attempts
+      false; // Flag to prevent multiple simultaneous connection attempts
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
 
-  // ─────────────────────────
-  // ■ UI State
-  // ─────────────────────────
-  String _connectionState = 'Initializing...'; // Initial state
-  final List<String> _cmdMessages = [];
+  // Debounce timers to prevent rapid state flipping / excessive publishing
+  Timer? _reconnectDebounceTimer;
+  Timer? _publishStatusDebounceTimer;
 
   @override
   void initState() {
     super.initState();
-    _initConnectivityWatcher();
+    WidgetsBinding.instance.addObserver(this);
+    _clientId = 'client_${DateTime.now().millisecondsSinceEpoch}';
+    _monitorConnectivity(); // Start monitoring connectivity first
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _statusTimer?.cancel();
+    _reconnectDebounceTimer?.cancel();
+    _publishStatusDebounceTimer?.cancel();
     _connectivitySub?.cancel();
-    _stopHeartbeat();
-    _client?.disconnect();
+    _performCleanDisconnect(); // Call the unified clean disconnect logic
     super.dispose();
   }
 
-  // ─────────────────────────
-  // ■ App Lifecycle (optional send offline on background)
-  // ─────────────────────────
+  // Unified method to handle clean disconnection and sending offline status
+  void _performCleanDisconnect() {
+    if (_client?.connectionStatus?.state == MqttConnectionState.connected) {
+      print('Performing clean disconnect: Publishing offline status.');
+      _publishStatus('offline (clean)'); // Explicitly send offline status
+    }
+    if (_client != null) {
+      try {
+        _client!.disconnect();
+        print('MQTT client disconnected.');
+      } catch (e) {
+        print('Error during client disconnect: $e');
+      }
+      _client = null;
+    }
+    _wasOnline = false;
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    print('App Lifecycle State Changed: $state');
-    if (_client?.connectionStatus?.state == MqttConnectionState.connected) {
-      if (state == AppLifecycleState.paused) {
-        // App is going to the background
-        _publishStatus('offline (paused)');
-      } else if (state == AppLifecycleState.resumed) {
-        // App is coming to the foreground
-        _publishStatus('online (resumed)');
+    print('App Lifecycle changed: $state');
+    if (state == AppLifecycleState.paused) {
+      // App going to background
+      if (_client?.connectionStatus?.state == MqttConnectionState.connected) {
+        print('App paused: stopping heartbeat and publishing paused status.');
+        _statusTimer?.cancel(); // Stop heartbeat to save resources
+        _publishStatus('paused'); // Inform broker that app is paused
       }
-      // Note: AppLifecycleState.inactive and .detached might also occur.
-      // 'paused' is the most common state when user switches apps.
-    } else {
-      print(
-        'App lifecycle change: Client not connected. Cannot publish status.',
-      );
-      // If app resumes and client is not connected, maybe attempt reconnect?
-      // Only attempt reconnect if we are not already connecting or connected
-      if (state == AppLifecycleState.resumed &&
-          !_isConnecting &&
-          (_client == null ||
-              _client?.connectionStatus?.state ==
-                  MqttConnectionState.disconnected)) {
-        print('App resumed and client not connected. Attempting reconnect.');
-        _connectAndListen(); // Try to reconnect on resume if disconnected
-      }
+    } else if (state == AppLifecycleState.resumed) {
+      // App coming to foreground
+      print('App resumed: checking connectivity and reconnecting if needed.');
+      // Re-evaluate connectivity and connection state
+      _monitorConnectivity(forceCheck: true); // Force an immediate check
     }
   }
 
-  // ─────────────────────────
-  // ■ Connectivity Watcher
-  // ─────────────────────────
-  void _initConnectivityWatcher() {
-    print('Initializing Connectivity Watcher');
-    Connectivity().checkConnectivity().then((result) {
-      _handleConnectivityResult(result); // Check initial state
-    });
+  // Monitors network connectivity changes
+  void _monitorConnectivity({bool forceCheck = false}) async {
+    if (_connectivitySub == null || forceCheck) {
+      if (_connectivitySub != null) {
+        await _connectivitySub!
+            .cancel(); // Cancel existing subscription if forcing
+      }
+      // Initial check
+      final List<ConnectivityResult> initialResult =
+          await Connectivity().checkConnectivity();
+      _handleConnectivityResult(initialResult);
 
-    _connectivitySub = Connectivity().onConnectivityChanged.listen((
-      List<ConnectivityResult> results, // Updated parameter type
-    ) {
-      _handleConnectivityResult(results); // Handle changes
-    });
+      // Listen for future changes
+      _connectivitySub = Connectivity().onConnectivityChanged.listen((
+        List<ConnectivityResult> result,
+      ) {
+        _handleConnectivityResult(result);
+      });
+    }
   }
 
   void _handleConnectivityResult(List<ConnectivityResult> results) {
-    // Updated parameter type
-    print('Connectivity changed: $results');
-    // Check if any of the results indicate no internet
-    final isNone = results.contains(ConnectivityResult.none);
+    final bool hasInternet = !results.contains(ConnectivityResult.none);
+    print('Connectivity results: $results. Has internet: $hasInternet');
 
-    if (isNone) {
-      setState(() => _connectionState = 'No Internet');
-      // Attempt to send status if still connected, useful if internet drops
-      // but the MQTT client hasn't realized it yet (until keep-alive fails)
-      _publishStatus('offline (no internet)');
-      // No need to explicitly disconnect client here, autoReconnect should handle it
+    if (!hasInternet) {
+      setState(() => _connectionStatus = 'No Internet');
+      print('Network lost. Disconnecting MQTT client if connected.');
+      _statusTimer?.cancel(); // Stop heartbeat
+      // Only publish offline if we were actually online and lost internet.
+      // The LWT is for broker-side, this is for proactive client-side notification.
+      if (_client?.connectionStatus?.state == MqttConnectionState.connected) {
+        _publishStatus('offline (no internet)');
+      }
+      _client?.disconnect(); // Force disconnect
+      _wasOnline = false; // Mark as not online
     } else {
-      setState(() => _connectionState = 'Internet Available');
-      // If connectivity is restored and client is disconnected, try to connect
+      setState(() => _connectionStatus = 'Internet Available');
+      // If internet is back and we are not connected, or were disconnected, try to connect
       if (!_isConnecting &&
           (_client == null ||
-              _client?.connectionStatus?.state ==
-                  MqttConnectionState.disconnected)) {
-        print(
-          'Connectivity restored and client is disconnected. Attempting reconnect.',
-        );
-        _connectAndListen();
-      } else {
-        // If already connected or connecting, and internet is available
-        // We could publish 'online' here, but heartbeat or onConnected already do this.
-        // Avoid excessive publishing.
+              _client!.connectionStatus?.state !=
+                  MqttConnectionState.connected)) {
+        _scheduleReconnect();
+      } else if (_client?.connectionStatus?.state ==
+          MqttConnectionState.connected) {
+        // If already connected, ensure heartbeat is running and send online status
+        _startStatusUpdates();
+        _publishStatus('online (network restored)');
       }
     }
   }
 
-  // ─────────────────────────
-  // ■ MQTT Connect & Subscribe
-  // ─────────────────────────
-  Future<void> _connectAndListen() async {
-    if (_client?.connectionStatus?.state == MqttConnectionState.connected)
+  void _connectMqtt() async {
+    if (_isConnecting) {
+      print('Connection already in progress. Skipping new attempt.');
       return;
-    // Build your JSON map for the offline LWT
-    final offlineWillPayload = json.encode({
-      'salesman': _salesmenId,
-      'pendingPushes': {
-        'salesOrders': _pendingSalesOrders,
-        'paymentsCollected': _pendingPaymentsCollected,
-      },
-      'lastWill': DateTime.now().toLocal().toIso8601String(),
+    }
+    // Only attempt if there's internet connectivity
+    final List<ConnectivityResult> currentConnectivity =
+        await Connectivity().checkConnectivity();
+    if (currentConnectivity.contains(ConnectivityResult.none)) {
+      print('Cannot connect: No internet connection.');
+      setState(() => _connectionStatus = 'No Internet');
+      return;
+    }
+
+    _isConnecting = true;
+    _performCleanDisconnect(); // Ensure previous client is properly disconnected
+    setState(() => _connectionStatus = 'Connecting...');
+    print('⚡ Attempting to connect to MQTT broker...');
+
+    // LWT payload for unexpected disconnections
+    final offlineWillPayload = jsonEncode({
       'status': 'offline (LWT)',
+      'geo': {
+        'lat': '6.9271',
+        'lon': '79.8612',
+      }, // Current geo-location for LWT
+      'timestamp': DateTime.now().toUtc().toIso8601String(),
     });
 
-    _client =
-        MqttServerClient.withPort(_broker, _clientId, _port)
-          ..logging(on: true)
-          ..keepAlivePeriod =
-              5 // <<—— very short keep-alive
-          ..autoReconnect = true
-          ..onConnected = _onConnected
-          ..onDisconnected = _onDisconnected
-          ..connectionMessage =
-              MqttConnectMessage()
-                  .withWillTopic(_statusTopic)
-                  .withWillMessage(offlineWillPayload)
-                  .withWillQos(MqttQos.atLeastOnce)
-                  .startClean();
+    _client = MqttServerClient.withPort(_broker, _clientId, _port);
+    _client!.logging(on: true); // Enable detailed logging
+    _client!.keepAlivePeriod = 20; // Keep alive 20 seconds
+    _client!.autoReconnect =
+        true; // Client will attempt to reconnect automatically
+    _client!.resubscribeOnAutoReconnect =
+        true; // Resubscribe topics on auto-reconnect
+    _client!.onConnected = _onConnected;
+    _client!.onDisconnected = _onDisconnected;
+    // Corrected: Assign callbacks directly, no chaining after print()
+    _client!.onAutoReconnect = () => print('🔄 MQTT auto reconnecting...');
+    _client!.onAutoReconnected = () => print('✅ MQTT auto reconnected');
+    _client!.onSubscribed = (topic) => print('📡 Subscribed to $topic');
+    _client!.onSubscribeFail = (topic) => print('❌ Failed to subscribe $topic');
+    _client!.pongCallback = () => print('🏓 Ping response received');
+
+    // Configure connection message including LWT
+    _client!.connectionMessage = MqttConnectMessage()
+        .withClientIdentifier(_clientId)
+        .startClean() // Clean session to ensure new state
+        .withWillTopic('status/$_clientId') // LWT topic using unique client ID
+        .withWillMessage(offlineWillPayload)
+        .withWillQos(MqttQos.atLeastOnce);
 
     try {
       await _client!.connect();
-    } catch (_) {
-      _client?.disconnect();
+    } catch (e) {
+      print('❌ MQTT connection failed: $e');
+      _performCleanDisconnect(); // Handle error by ensuring client is disconnected
+      setState(() => _connectionStatus = 'Connection Failed: $e');
+    } finally {
+      _isConnecting = false;
     }
   }
 
-  void _onConnected() {
-    setState(() => _connectionState = 'MQTT Connected');
-    _publishStatus('online'); // immediately announce you're back
-    _client!.subscribe(_cmdTopic, MqttQos.atLeastOnce);
-    _client!.updates!.listen(_onMessage);
-    _startHeartbeat();
-  }
-
-  void _onDisconnected() {
-    print('MQTT disconnected (app-side)');
-    _stopHeartbeat();
-    // NOTE: Do not try to publish here — connection is gone.
-    setState(() => _connectionState = 'MQTT Disconnected');
-    // broker will publish LWT "offline (LWT)" after ~5s
-  }
-
-  // Handle incoming messages
-  void _onMessage(List<MqttReceivedMessage<MqttMessage?>>? events) {
-    // --- FIX: Add safety check for null or empty events list ---
-    if (events == null || events.isEmpty) {
-      print('Received null or empty MQTT message list. Ignoring.');
-      return;
-    }
-
-    // Loop through all messages in the list (although often it's just one)
-    for (final messageEvent in events) {
-      final MqttMessage? message = messageEvent.payload;
-
-      // --- FIX: Check if payload is valid MqttPublishMessage ---
-      if (message is! MqttPublishMessage) {
-        print(
-          'Received non-publish message type: ${message?.runtimeType}. Ignoring.',
-        );
-        continue; // Skip to the next message if not a publish message
-      }
-
-      final MqttPublishMessage rec = message;
-      final String topic = messageEvent.topic ?? 'Unknown Topic'; // Get topic
-      final msg = MqttPublishPayload.bytesToStringAsString(rec.payload.message);
-      print('CMD received on topic "$topic": "$msg"');
-
-      // parse JSON or raw
-      String display = msg;
-      try {
-        final jsonObj = json.decode(msg);
-        if (jsonObj is Map) {
-          // Check for common command keys or just display the map
-          if (jsonObj.containsKey('command') && jsonObj['command'] is String) {
-            display = 'CMD ▶ ${jsonObj['command']}';
-          } else {
-            display =
-                'JSON Map ▶ ${jsonObj.toString()}'; // Display the map content
-          }
-        } else if (jsonObj is List) {
-          display = 'JSON List ▶ ${jsonObj.toString()}'; // Display list content
-        } else {
-          display =
-              'JSON Value ▶ ${jsonObj.toString()}'; // Display other JSON primitives
-        }
-      } catch (e) {
-        // If JSON parsing fails, display the raw message
-        // print('Failed to parse message as JSON: $e'); // Keep this print for debugging specific messages
-        display = 'RAW ▶ $msg';
-      }
-
-      // Update UI state with the received command message
-      // Use insert(0) to add to the beginning of the list
-      setState(
-        () => _cmdMessages.insert(
-          0,
-          '[${DateTime.now().toLocal().toString().substring(11, 19)}] $display',
-        ), // Added timestamp formatting
-      );
-    }
-  }
-
-  // ─────────────────────────
-  // ■ Periodic Heartbeat
-  // ─────────────────────────
-  void _startHeartbeat() {
-    _stopHeartbeat();
-    _heartbeatTimer = Timer.periodic(Duration(seconds: 30), (_) {
-      if (_client?.connectionStatus?.state == MqttConnectionState.connected) {
-        _publishStatus('online (heartbeat)');
-      }
+  void _scheduleReconnect() {
+    if (_reconnectDebounceTimer?.isActive ?? false) return;
+    print('Scheduling reconnect in 3 seconds...');
+    _reconnectDebounceTimer = Timer(const Duration(seconds: 3), () {
+      print('Scheduled reconnect triggered. Attempting connection...');
+      _connectMqtt();
     });
   }
 
-  void _stopHeartbeat() {
-    _heartbeatTimer?.cancel();
-    _heartbeatTimer = null;
+  void _onConnected() {
+    print('✅ Connected to MQTT broker');
+    setState(() => _connectionStatus = 'Connected');
+    _startStatusUpdates(); // Start periodic heartbeats
+    _publishStatus('online (initial)'); // Publish initial online status
+    _wasOnline = true; // Mark that we are now online
   }
 
-  void _publishStatus(String status) {
-    if (_client?.connectionStatus?.state == MqttConnectionState.connected) {
-      final payloadMap = {
-        'salesman': _salesmenId,
-        'pendingPushes': {
-          'salesOrders': _pendingSalesOrders,
-          'paymentsCollected': _pendingPaymentsCollected,
-        },
-        'lastWill': DateTime.now().toLocal().toIso8601String(),
-        'status': status,
-      };
-      final payloadString = json.encode(payloadMap);
-
-      final builder = MqttClientPayloadBuilder()..addString(payloadString);
-      _client!.publishMessage(
-        _statusTopic,
-        MqttQos.atLeastOnce,
-        builder.payload!,
-        retain: false,
-      );
-      print('Published status JSON: $payloadString');
-    } else {
-      print('Cannot publish status: MQTT not connected.');
+  void _onDisconnected() {
+    print('🔌 Disconnected from MQTT broker');
+    setState(() => _connectionStatus = 'Disconnected');
+    _statusTimer?.cancel(); // Stop heartbeats
+    // LWT will handle the "offline" message for unclean disconnects.
+    // If it was a clean disconnect (e.g., app dispose), _performCleanDisconnect handled it.
+    _wasOnline = false; // Mark as not online
+    // Attempt reconnect if not a clean disconnect and auto-reconnect is not handling it
+    if (!_isConnecting &&
+        _client?.connectionStatus?.state != MqttConnectionState.connected) {
+      _scheduleReconnect();
     }
   }
 
-  // ─────────────────────────
-  // ■ Build UI
-  // ─────────────────────────
+  // Starts the timer for periodic online status updates (heartbeat)
+  void _startStatusUpdates() {
+    _statusTimer?.cancel(); // Cancel any existing timer
+    _statusTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
+      if (_client?.connectionStatus?.state == MqttConnectionState.connected) {
+        // TODO: Implement actual geo-location retrieval here using geolocator
+        // try {
+        //   Position position = await Geolocator.getCurrentPosition(
+        //     desiredAccuracy: LocationAccuracy.low,
+        //     timeLimit: const Duration(seconds: 5)
+        //   );
+        //   _currentGeoLocation = {
+        //     'lat': position.latitude.toString(),
+        //     'lon': position.longitude.toString(),
+        //   };
+        // } catch (e) {
+        //   print('Failed to get updated geo-location: $e');
+        // }
+        _publishStatus('online (heartbeat)');
+      } else {
+        print('MQTT not connected for heartbeat. Stopping status updates.');
+        _statusTimer?.cancel();
+      }
+    });
+    print('Started periodic status updates (every 10s).');
+  }
+
+  // Publishes status messages with a debounce to prevent rapid spamming
+  void _publishStatus(String status) {
+    _publishStatusDebounceTimer?.cancel(); // Cancel any pending debounce
+    _publishStatusDebounceTimer = Timer(const Duration(milliseconds: 500), () {
+      _sendMqttStatus(status);
+    });
+  }
+
+  // Internal function to send the MQTT status message
+  void _sendMqttStatus(String status) {
+    if (_client?.connectionStatus?.state == MqttConnectionState.connected) {
+      // Use _clientId for the unique client's status topic
+      final topic = 'status/$_clientId';
+      final payload = jsonEncode({
+        'status': status,
+        'geo': {
+          "lat": "6.9271",
+          "lon": "79.8612",
+        }, // _currentGeoLocation, // Include current geo-location
+        'timestamp': DateTime.now().toUtc().toIso8601String(),
+      });
+
+      final builder = MqttClientPayloadBuilder()..addString(payload);
+      _client!.publishMessage(topic, MqttQos.atLeastOnce, builder.payload!);
+      print('📤 Published "$status" to $topic');
+
+      // Update _wasOnline flag based on the published status
+      _wasOnline = status.toLowerCase().startsWith('online');
+    } else {
+      print('⚠️ Cannot publish "$status" status: MQTT not connected.');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: Text('MQTT Status & CMD Tracker')),
-      body: Column(
-        crossAxisAlignment:
-            CrossAxisAlignment.stretch, // Stretch children horizontally
-        children: [
-          ListTile(
-            leading: Icon(
-              _connectionState.contains('Connected')
-                  ? Icons
-                      .cloud_done // Connected icon
-                  : (_connectionState.contains('Connecting')
-                      ? Icons.cloud_upload
-                      : Icons.cloud_off), // Connecting or Disconnected icon
-              color:
-                  _connectionState.contains('Connected')
-                      ? Colors
-                          .green // Connected color
-                      : (_connectionState.contains('Connecting')
-                          ? Colors.orange
-                          : Colors.red), // Connecting or Disconnected color
-            ),
-            title: Text('Connection: $_connectionState'),
-            trailing:
-                _connectionState.contains('Disconnected') ||
-                        _connectionState.contains('Failed') ||
-                        _connectionState.contains('Exception')
-                    ? IconButton(
-                      // Add a retry button if disconnected or failed
-                      icon: Icon(Icons.refresh),
-                      onPressed:
-                          _isConnecting
-                              ? null
-                              : _connectAndListen, // Disable while connecting
-                      tooltip: 'Retry Connection',
-                    )
-                    : null, // No trailing button if connected
+    return MaterialApp(
+      home: Scaffold(
+        appBar: AppBar(title: const Text('MQTT Auto Status Tracker')),
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                _connectionStatus.contains('Connected')
+                    ? Icons.cloud_done
+                    : (_connectionStatus.contains('Connecting') || _isConnecting
+                        ? Icons.cloud_upload
+                        : Icons.cloud_off),
+                color:
+                    _connectionStatus.contains('Connected')
+                        ? Colors.green
+                        : (_connectionStatus.contains('Connecting') ||
+                                _isConnecting
+                            ? Colors.orange
+                            : Colors.red),
+                size: 60,
+              ),
+              const SizedBox(height: 20),
+              Text(
+                'MQTT Status: $_connectionStatus',
+                style: const TextStyle(fontSize: 24),
+              ),
+              Text(
+                'Client ID: $_clientId',
+                style: const TextStyle(fontSize: 14, color: Colors.grey),
+              ),
+              Text(
+                'Broker: $_broker:$_port',
+                style: const TextStyle(fontSize: 14, color: Colors.grey),
+              ),
+              const SizedBox(height: 20),
+              // Manual reconnect button if disconnected or error
+              if (_connectionStatus.contains('Disconnected') ||
+                  _connectionStatus.contains('No Internet') ||
+                  _connectionStatus.contains('Failed'))
+                ElevatedButton(
+                  onPressed: _isConnecting ? null : _connectMqtt,
+                  child:
+                      _isConnecting
+                          ? const CircularProgressIndicator(color: Colors.white)
+                          : const Text('Retry Connection'),
+                ),
+            ],
           ),
-          Divider(),
-          Padding(
-            padding: const EdgeInsets.symmetric(
-              horizontal: 16.0,
-              vertical: 8.0,
-            ),
-            child: Text(
-              'Received Commands:',
-              // FIX: Use headlineSmall instead of deprecated headline6
-              style: Theme.of(context).textTheme.headlineSmall,
-              textAlign: TextAlign.center,
-            ),
-          ),
-          Expanded(
-            child: ListView.builder(
-              reverse:
-                  false, // Keep reverse: false as insert(0) adds to the top
-              padding: EdgeInsets.all(12),
-              itemCount: _cmdMessages.length,
-              itemBuilder:
-                  (_, i) => Card(
-                    margin: EdgeInsets.symmetric(vertical: 4),
-                    child: Padding(
-                      padding: EdgeInsets.all(8),
-                      child: Text(
-                        _cmdMessages[i],
-                        style: TextStyle(fontSize: 14.0),
-                      ),
-                    ),
-                  ),
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
